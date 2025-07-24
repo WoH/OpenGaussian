@@ -312,3 +312,252 @@ def srgb_to_linear(srgb):
         return np.where(srgb <= 0.04045, linear0, linear1)
     else:
         raise NotImplementedError
+
+
+# Multi-View CLIP Feature Fusion Functions
+
+def compute_gaussian_visibility(gaussians_xyz, cameras, depth_maps, gaussian_scales=None):
+    """
+    Compute which views each 3D Gaussian is visible from.
+    
+    Args:
+        gaussians_xyz: [N_gaussians, 3] - 3D positions of Gaussians
+        cameras: List of camera objects
+        depth_maps: Dict {view_idx: depth[H, W]} - depth maps for each view
+        gaussian_scales: [N_gaussians, 3] - scales of Gaussians (optional, for better occlusion testing)
+    
+    Returns:
+        visibility_matrix: [N_gaussians, N_views] - boolean visibility matrix
+        projected_coords: Dict {view_idx: [N_gaussians, 2]} - 2D projections per view
+    """
+    N_gaussians = gaussians_xyz.shape[0]
+    N_views = len(cameras)
+    visibility_matrix = torch.zeros(N_gaussians, N_views, dtype=torch.bool, device=gaussians_xyz.device)
+    projected_coords = {}
+    
+    for view_idx, camera in enumerate(cameras):
+        # Project 3D points to 2D
+        gaussians_xyz_hom = torch.cat([gaussians_xyz, torch.ones(N_gaussians, 1, device=gaussians_xyz.device)], dim=1)
+        
+        # Transform to camera space
+        cam_coords = (camera.world_view_transform @ gaussians_xyz_hom.T).T  # [N_gaussians, 4]
+        
+        # Project to screen space
+        screen_coords = (camera.projection_matrix @ cam_coords.T).T  # [N_gaussians, 4]
+        
+        # Perspective divide (avoid division by zero)
+        w_coords = screen_coords[:, 3:4]
+        w_coords = torch.where(torch.abs(w_coords) < 1e-6, torch.sign(w_coords) * 1e-6, w_coords)
+        screen_coords = screen_coords / w_coords  # [N_gaussians, 4]
+        
+        # Convert to pixel coordinates
+        H, W = depth_maps[view_idx].shape if view_idx in depth_maps else (480, 640)  # Default resolution
+        pixel_coords = torch.zeros(N_gaussians, 2, device=gaussians_xyz.device)
+        pixel_coords[:, 0] = (screen_coords[:, 0] + 1.0) * 0.5 * W
+        pixel_coords[:, 1] = (screen_coords[:, 1] + 1.0) * 0.5 * H
+        
+        projected_coords[view_idx] = pixel_coords.clone()
+        
+        # Check bounds
+        in_bounds = (pixel_coords[:, 0] >= 0) & (pixel_coords[:, 0] < W) & \
+                   (pixel_coords[:, 1] >= 0) & (pixel_coords[:, 1] < H)
+        
+        # Check depth (if depth map available)
+        if view_idx in depth_maps:
+            depth_map = depth_maps[view_idx]
+            pixel_coords_int = pixel_coords.long().clamp(min=0)
+            pixel_coords_int[:, 0] = pixel_coords_int[:, 0].clamp(max=W-1)
+            pixel_coords_int[:, 1] = pixel_coords_int[:, 1].clamp(max=H-1)
+            
+            # Get depth at projected locations
+            projected_depths = depth_map[pixel_coords_int[:, 1], pixel_coords_int[:, 0]]
+            gaussian_depths = cam_coords[:, 2]  # Z coordinate in camera space
+            
+            # Account for Gaussian scale in depth testing (optional)
+            depth_tolerance = 0.1  # Default tolerance
+            if gaussian_scales is not None:
+                # Use maximum scale as depth tolerance
+                depth_tolerance = gaussian_scales.max(dim=1)[0] * 0.5
+            
+            depth_visible = torch.abs(gaussian_depths - projected_depths) < depth_tolerance
+        else:
+            # No depth testing, assume visible if in bounds and in front of camera
+            depth_visible = cam_coords[:, 2] > 0.1  # Must be in front of camera
+        
+        # Combine bounds and depth checks
+        visibility_matrix[:, view_idx] = in_bounds & depth_visible
+    
+    return visibility_matrix, projected_coords
+
+
+def aggregate_clip_features_per_view(sam_masks_dict, clip_features_dict, projected_coords, visibility_matrix):
+    """
+    Assign CLIP features to Gaussians based on SAM mask membership.
+    
+    Args:
+        sam_masks_dict: Dict {view_idx: mask_bool[num_masks, H, W]} - SAM masks per view
+        clip_features_dict: Dict {view_idx: clip_features[num_masks, 512]} - CLIP features per mask per view
+        projected_coords: Dict {view_idx: [N_gaussians, 2]} - 2D projections of Gaussians
+        visibility_matrix: [N_gaussians, N_views] - boolean visibility matrix
+    
+    Returns:
+        gaussian_clip_features: Dict {view_idx: [N_gaussians, 512]} - CLIP features per Gaussian per view
+    """
+    N_gaussians = visibility_matrix.shape[0]
+    gaussian_clip_features = {}
+    
+    for view_idx in sam_masks_dict.keys():
+        if view_idx not in clip_features_dict or view_idx not in projected_coords:
+            continue
+            
+        sam_masks = sam_masks_dict[view_idx]  # [num_masks, H, W]
+        clip_features = clip_features_dict[view_idx]  # [num_masks, 512]
+        coords = projected_coords[view_idx]  # [N_gaussians, 2]
+        
+        # Initialize with zero features
+        view_features = torch.zeros(N_gaussians, 512, device=clip_features.device)
+        
+        # Only process visible Gaussians
+        visible_mask = visibility_matrix[:, view_idx]
+        visible_coords = coords[visible_mask]
+        
+        if visible_mask.sum() == 0:
+            gaussian_clip_features[view_idx] = view_features
+            continue
+        
+        # Convert to integer coordinates
+        H, W = sam_masks.shape[1], sam_masks.shape[2]
+        pixel_coords = visible_coords.long().clamp(min=0)
+        pixel_coords[:, 0] = pixel_coords[:, 0].clamp(max=W-1)
+        pixel_coords[:, 1] = pixel_coords[:, 1].clamp(max=H-1)
+        
+        # Find which mask each visible Gaussian belongs to
+        mask_assignments = torch.zeros(visible_mask.sum(), dtype=torch.long, device=sam_masks.device)
+        
+        for i, (y, x) in enumerate(pixel_coords):
+            # Check all masks at this pixel location
+            mask_values = sam_masks[:, y, x]  # [num_masks]
+            
+            # Find the first mask that contains this pixel (masks are mutually exclusive)
+            mask_indices = torch.where(mask_values)[0]
+            if len(mask_indices) > 0:
+                mask_assignments[i] = mask_indices[0]
+            # else: remains 0 (background/no mask)
+        
+        # Assign CLIP features based on mask assignments
+        visible_features = torch.zeros(visible_mask.sum(), 512, device=clip_features.device)
+        
+        for mask_idx in range(clip_features.shape[0]):
+            mask_gaussians = (mask_assignments == mask_idx)
+            if mask_gaussians.sum() > 0:
+                visible_features[mask_gaussians] = clip_features[mask_idx]
+        
+        # Place visible features back into full feature tensor
+        view_features[visible_mask] = visible_features
+        gaussian_clip_features[view_idx] = view_features
+    
+    return gaussian_clip_features
+
+
+def compute_view_weights(gaussians_xyz, cameras, visibility_matrix, projected_coords):
+    """
+    Compute reliability weights for each view based on distance and viewing angle.
+    
+    Args:
+        gaussians_xyz: [N_gaussians, 3] - 3D positions of Gaussians
+        cameras: List of camera objects
+        visibility_matrix: [N_gaussians, N_views] - boolean visibility matrix
+        projected_coords: Dict {view_idx: [N_gaussians, 2]} - 2D projections per view
+        
+    Returns:
+        weights: [N_gaussians, N_views] - normalized weights for visible pairs
+    """
+    N_gaussians, N_views = visibility_matrix.shape
+    weights = torch.zeros_like(visibility_matrix, dtype=torch.float32)
+    
+    for view_idx, camera in enumerate(cameras):
+        if view_idx not in projected_coords:
+            continue
+        
+        visible_mask = visibility_matrix[:, view_idx]
+        if not visible_mask.any():
+            continue
+        
+        visible_gaussians = gaussians_xyz[visible_mask]
+        
+        # Compute camera center in world coordinates
+        camera_center = camera.camera_center  # [3]
+        
+        # Distance weighting (closer = higher weight)
+        distances = torch.norm(visible_gaussians - camera_center, dim=1)  # [N_visible]
+        distance_weights = 1.0 / (distances + 1e-6)  # Inverse distance
+        
+        # Viewing angle weighting (front-facing = higher weight)
+        # Compute view directions
+        view_directions = F.normalize(visible_gaussians - camera_center, dim=1)  # [N_visible, 3]
+        
+        # Camera forward direction (assuming camera looks down negative Z)
+        camera_forward = camera.world_view_transform[:3, 2]  # Camera's Z axis in world coords
+        camera_forward = -F.normalize(camera_forward.unsqueeze(0), dim=1)  # [1, 3]
+        
+        # Compute dot product (cosine of angle)
+        angle_weights = torch.clamp(torch.sum(view_directions * camera_forward, dim=1), min=0.0)  # [N_visible]
+        
+        # Combine weights
+        combined_weights = distance_weights * angle_weights
+        
+        # Place back into full weight tensor
+        weights[visible_mask, view_idx] = combined_weights
+    
+    # Normalize weights per Gaussian (so they sum to 1 across views)
+    row_sums = weights.sum(dim=1, keepdim=True)
+    row_sums[row_sums == 0] = 1.0  # Avoid division by zero
+    weights = weights / row_sums
+    
+    return weights
+
+
+def fuse_multiview_clip_features(gaussian_clip_features, visibility_matrix, view_weights):
+    """
+    Average CLIP features across visible views with reliability weighting.
+    
+    Args:
+        gaussian_clip_features: Dict {view_idx: [N_gaussians, 512]} - CLIP features per view
+        visibility_matrix: [N_gaussians, N_views] - boolean visibility matrix
+        view_weights: [N_gaussians, N_views] - normalized reliability weights
+        
+    Returns:
+        fused_features: [N_gaussians, 512] - fused CLIP features
+    """
+    if not gaussian_clip_features:
+        return torch.zeros(visibility_matrix.shape[0], 512)
+    
+    N_gaussians = visibility_matrix.shape[0]
+    feature_dim = 512
+    device = next(iter(gaussian_clip_features.values())).device
+    
+    fused_features = torch.zeros(N_gaussians, feature_dim, device=device)
+    
+    # Stack all view features and weights
+    view_indices = sorted(gaussian_clip_features.keys())
+    stacked_features = torch.stack([gaussian_clip_features[idx] for idx in view_indices], dim=2)  # [N_gaussians, 512, N_valid_views]
+    stacked_weights = view_weights[:, view_indices]  # [N_gaussians, N_valid_views]
+    stacked_visibility = visibility_matrix[:, view_indices]  # [N_gaussians, N_valid_views]
+    
+    # Apply visibility mask to weights
+    masked_weights = stacked_weights * stacked_visibility.float()
+    
+    # Weighted average across views
+    weighted_features = stacked_features * masked_weights.unsqueeze(1)  # [N_gaussians, 512, N_valid_views]
+    fused_features = weighted_features.sum(dim=2)  # [N_gaussians, 512]
+    
+    # Handle Gaussians that are not visible in any view
+    visible_anywhere = visibility_matrix.any(dim=1)
+    invisible_gaussians = ~visible_anywhere
+    
+    if invisible_gaussians.any():
+        # For invisible Gaussians, use zero features or learned embeddings
+        # This could be enhanced with learned "default" semantic embeddings
+        fused_features[invisible_gaussians] = 0.0
+    
+    return fused_features

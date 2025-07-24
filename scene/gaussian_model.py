@@ -66,6 +66,7 @@ class GaussianModel:
         self._opacity = torch.empty(0)
         self._ins_feat = torch.empty(0)     # Continuous instance features before quantization
         self._ins_feat_q = torch.empty(0)   # Discrete instance features after quantization
+        self._clip_features = torch.empty(0)  # Multi-view fused CLIP features [N_gaussians, 512]
         self.iClusterSubNum = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -86,6 +87,7 @@ class GaussianModel:
             self._opacity,
             self._ins_feat,     # Continuous instance features before quantization
             self._ins_feat_q,   # Discrete instance features after quantization
+            self._clip_features, # Multi-view fused CLIP features
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
@@ -103,6 +105,7 @@ class GaussianModel:
         self._opacity,
         self._ins_feat,     # Continuous instance features before quantization
         self._ins_feat_q,   # Discrete instance features after quantization
+        self._clip_features, # Multi-view fused CLIP features
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
@@ -161,6 +164,14 @@ class GaussianModel:
             ins_feat = self._ins_feat_q
         ins_feat = torch.nn.functional.normalize(ins_feat, dim=1)
         return ins_feat
+    
+    def get_clip_features(self):
+        """Get multi-view fused CLIP features."""
+        return self._clip_features
+    
+    def set_clip_features(self, features):
+        """Set multi-view fused CLIP features."""
+        self._clip_features = features
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
