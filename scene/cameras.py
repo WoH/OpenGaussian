@@ -72,6 +72,13 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+        
+        # Add intrinsic matrix K for multi-view refinement
+        fx = self.image_width / (2.0 * np.tan(self.FoVx / 2.0))
+        fy = self.image_height / (2.0 * np.tan(self.FoVy / 2.0))
+        self.K = torch.tensor([[fx, 0, self.cx],
+                               [0, fy, self.cy],
+                               [0, 0, 1]], device=self.data_device, dtype=torch.float32)
     
     # modify -----
     def to_gpu(self):
