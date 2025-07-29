@@ -140,11 +140,31 @@ def update_training_config_for_fusion(args):
         print(f"Visibility JSON path: {args.visibility_json_path}")
         print("===================================================\n")
         
-        # Ensure paths exist if specified
-        if args.fused_features_path and not os.path.exists(args.fused_features_path):
-            print(f"Warning: Fused features file not found: {args.fused_features_path}")
-            
-        if args.visibility_json_path and not os.path.exists(args.visibility_json_path):
-            print(f"Warning: Visibility JSON file not found: {args.visibility_json_path}")
+        # Validate fusion configuration
+        validation_errors = []
+        
+        # Check if fused features path is provided and exists
+        if args.fused_features_path:
+            if not os.path.exists(args.fused_features_path):
+                validation_errors.append(f"Fused features file not found: {args.fused_features_path}")
+        else:
+            print("Warning: No fused features path provided - will attempt on-the-fly fusion")
+        
+        # Check visibility weighting requirements
+        if args.use_visibility_weights:
+            if not args.visibility_json_path:
+                validation_errors.append("Visibility JSON path required when using visibility weights")
+            elif not os.path.exists(args.visibility_json_path):
+                validation_errors.append(f"Visibility JSON file not found: {args.visibility_json_path}")
+        
+        # Print errors and warnings
+        if validation_errors:
+            print("\n❌ Multi-View Fusion Configuration Errors:")
+            for error in validation_errors:
+                print(f"  - {error}")
+            print("\nPlease run the feature fusion pipeline first:")
+            print("  bash scripts/run_feature_fusion_pipeline.sh <scene_path>")
+            print("Or disable fusion with --use_fused_features=False\n")
+            raise ValueError("Multi-view fusion configuration validation failed")
     
     return args

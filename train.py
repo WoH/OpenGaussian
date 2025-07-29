@@ -36,6 +36,8 @@ from utils.system_utils import mkdir_p
 from utils.opengs_utlis import mask_feature_mean, pair_mask_feature_mean, \
     get_SAM_mask_and_feat, load_code_book, \
     calculate_iou, calculate_distances, calculate_pairwise_distances
+from utils.train_utils import FeatureFusionManager, get_mask_features_with_fusion, \
+    update_training_config_for_fusion
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -165,6 +167,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    
+    # Initialize multi-view feature fusion manager
+    fusion_manager = FeatureFusionManager(opt)
+    opt = update_training_config_for_fusion(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         # NOTE: Load the original 3DGS pre-trained checkpoint and add the ins_feat attribute. [OpenGaussian]
@@ -406,7 +412,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # #################################################
             if cb_mode is None:
                 # (0) compute the average instance features within each mask. [num_mask, 6]
-                feat_mean_stack = mask_feature_mean(rendered_ins_feat, mask_bool, image_mask=rendered_silhouette)
+                # Use multi-view fusion if enabled, otherwise fall back to single-view
+                feature_dir = os.path.join(dataset.source_path, "language_features")
+                feat_mean_stack = get_mask_features_with_fusion(
+                    viewpoint_cam, mask_bool, rendered_ins_feat, 
+                    fusion_manager, gaussians, scene.getTrainCameras(), 
+                    feature_dir, iteration, opt.start_ins_feat_iter
+                )
                 # (1) intra-mask smoothing loss. Eq.(1) in the paper
                 loss_cohesion = cohesion_loss(rendered_ins_feat, mask_bool, feat_mean_stack)
                 # (2) inter-mask contrastive loss Eq.(2) in the paper
