@@ -106,6 +106,20 @@ class OptimizationParams(ParamGroup):
         parser.add_argument('--sam_level', type=int, default=3)
 
         parser.add_argument('--save_memory', action='store_true', default=False)
+        
+        # Multi-view CLIP feature fusion parameters
+        parser.add_argument('--use_fused_features', action='store_true', default=False,
+                           help='Use multi-view fused CLIP features')
+        parser.add_argument('--fused_features_path', type=str, default=None,
+                           help='Path to precomputed fused features file')
+        parser.add_argument('--use_visibility_weights', action='store_true', default=False,
+                           help='Use visibility-based weighting for feature fusion')
+        parser.add_argument('--visibility_weight_type', type=str, default='distance',
+                           choices=['uniform', 'distance', 'angle', 'area'],
+                           help='Type of visibility weighting')
+        parser.add_argument('--visibility_json_path', type=str, default=None,
+                           help='Path to visibility mapping JSON file')
+        
         super().__init__(parser, "Optimization Parameters")
     
     def extract(self, args):
@@ -121,6 +135,11 @@ class OptimizationParams(ParamGroup):
         g.start_root_cb_iter = args.start_root_cb_iter
         g.start_leaf_cb_iter = args.start_leaf_cb_iter
         g.save_memory = args.save_memory
+        g.use_fused_features = args.use_fused_features
+        g.fused_features_path = args.fused_features_path
+        g.use_visibility_weights = args.use_visibility_weights
+        g.visibility_weight_type = args.visibility_weight_type
+        g.visibility_json_path = args.visibility_json_path
 
         return g
 

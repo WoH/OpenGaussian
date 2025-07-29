@@ -15,3 +15,9 @@ screenshots
 output*
 *.log
 log
+
+# Documentation and planning files
+docs/
+
+# Data files
+data/
